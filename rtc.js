@@ -198,21 +198,28 @@ const joinRoom = (code, { role, onConn, onStatus }) => {
         onStatus && onStatus({ present: n });
     });
 
-    let helloT = null;
+    let helloT = null, subscribed = false, wantAnnounce = (role === 'recv');
+    const say = () => {
+        // Quiet while we're actually talking to someone; starts up again by itself if that
+        // connection drops, which is what makes an interrupted transfer reconnect.
+        if ([...room._conns.values()].some((c) => c.api.open)) return;
+        try { ch.send({ type: 'broadcast', event: 'hello', payload: { from: myId } }); } catch (e) {}
+    };
+    // The app turns announcing off once the transfer is finished or cancelled — otherwise a
+    // completed receiver would keep advertising and get re-dialled forever.
+    room.announce = (on) => {
+        wantAnnounce = on;
+        clearInterval(helloT);
+        helloT = null;
+        if (on && subscribed) { say(); helloT = setInterval(say, 2500); }
+    };
+
     ch.subscribe((status) => {
         if (status === 'SUBSCRIBED') {
+            subscribed = true;
             ch.track({ role, t: Date.now() });
             onStatus && onStatus({ joined: true });
-            if (role === 'recv') {
-                const say = () => {
-                    // Stop pestering for good once we're actually talking to someone —
-                    // re-announcing after a finished transfer would just re-dial forever.
-                    if ([...room._conns.values()].some((c) => c.api.open)) { clearInterval(helloT); return; }
-                    try { ch.send({ type: 'broadcast', event: 'hello', payload: { from: myId } }); } catch (e) {}
-                };
-                say();
-                helloT = setInterval(say, 2500);
-            }
+            if (wantAnnounce) room.announce(true);
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
             onStatus && onStatus({ error: 'Lost the connection to the signaling channel.' });
         }

@@ -1,4 +1,4 @@
-import { pickChunk, makeMeter, safeName, sum, throttle } from './util.js';
+import { pickChunk, clampOffset, makeMeter, safeName, sum, throttle } from './util.js';
 
 // ===================== the transfer protocol =====================
 // One reliable, ordered data channel per peer carries both control messages (JSON strings)
@@ -99,11 +99,18 @@ const createSender = ({ onChange }) => {
                 const ans = await waitFor(p, `ready:${f.id}`, READY_TIMEOUT);
                 if (ans.t === 'skip') { p.skipped.add(f.id); p.cur = null; changed(); continue; }
 
+                // The receiver is the authority on where to pick up: after a dropped
+                // connection it still holds the part-written file and tells us its length.
+                const startAt = clampOffset(ans.offset, f.size);
+                p.cur.sent = startAt;
+                if (startAt > 0) { p.cur.resumed = startAt; p.meter.reset(Date.now()); }
+                changed();
+
                 const dc = p.conn.dataChannel;
                 dc.bufferedAmountLowThreshold = LOW_WATER;
                 const chunk = pickChunk(p.conn.maxMessage);
 
-                for (let off = 0; off < f.size; off += chunk) {
+                for (let off = startAt; off < f.size; off += chunk) {
                     if (!p.conn.open) throw new Error('closed');
                     if (p.paused) await p.pauseGate;
                     await drain(dc);
@@ -137,17 +144,20 @@ const createSender = ({ onChange }) => {
 
     // Wire up a freshly connected receiver.
     const attach = (conn) => {
+        // Same person reconnecting after a drop — retire the stale card so they don't
+        // appear twice while the resumed transfer runs.
+        peers.forEach((old, key) => { if (old.conn.peer === conn.peer && !old.conn.open) peers.delete(key); });
         const p = {
             conn, id: conn.id, status: 'connecting', error: '',
             queue: [], done: new Set(), skipped: new Set(), waits: new Map(),
-            cur: null, sentBytes: 0, busy: false, paused: false, pauseGate: null, releaseGate: null,
+            cur: null, sentBytes: 0, priorBytes: 0, busy: false, paused: false, pauseGate: null, releaseGate: null,
             meter: makeMeter(), rate: 0, safety: '', route: '',
         };
         // Progress readout: bytes handed to SCTP minus what's still queued locally ≈ what
         // has actually gone out on the wire. Throttled — this fires per chunk, i.e. tens of
         // thousands of times a second on a fast local link.
         p.tick = throttle(() => {
-            const onWire = Math.max(0, p.sentBytes + (p.cur ? p.cur.sent : 0) - conn.bufferedAmount);
+            const onWire = Math.max(0, p.priorBytes + p.sentBytes + (p.cur ? p.cur.sent : 0) - conn.bufferedAmount);
             p.rate = p.meter.push(onWire, Date.now());
             p.onWire = onWire;
             changed();
@@ -168,11 +178,16 @@ const createSender = ({ onChange }) => {
         conn.on('data', (d) => {
             if (!d || !d.t) return;
             switch (d.t) {
-                case 'start':
+                case 'start': {
                     p.queue = (d.ids || []).filter((id) => files.some((f) => f.id === id) && !p.done.has(id));
+                    // Anything the receiver didn't ask for, it already has — count it as
+                    // delivered so a reconnect doesn't restart the progress bar at zero.
+                    files.forEach((f) => { if (!p.queue.includes(f.id)) p.done.add(f.id); });
+                    p.priorBytes = sum(files.filter((f) => p.done.has(f.id)), 'size');
                     p.meter.reset(Date.now());
                     pump(p);
                     break;
+                }
                 case 'ready': case 'skip': settle(p, `ready:${d.id}`, d); break;
                 case 'ok': case 'fail': settle(p, `ok:${d.id}`, d); break;
                 case 'pause':
@@ -205,26 +220,45 @@ const createSender = ({ onChange }) => {
 };
 
 // ===================== receiver =====================
+// Survives a dropped connection: the half-written file is kept open and, when the peer comes
+// back, the transfer picks up at the exact byte it stopped on (see `rebind`).
 const createReceiver = ({ conn, onChange }) => {
     const st = {
-        status: 'connecting',      // connecting | offered | saving | done | error | gone
+        // connecting | waiting-offer | offered | saving | reconnecting | done | error | gone
+        status: 'connecting',
         files: [],                 // { id, name, size, type, status, recv }
         dest: null, error: '', safety: '', route: '',
-        recvBytes: 0, rate: 0, meter: makeMeter(),
+        recvBytes: 0, rate: 0, meter: makeMeter(), resumes: 0,
     };
+    let link = conn;               // swapped out by rebind() when we reconnect
     let sink = null, cur = null;
     let queue = Promise.resolve(), pending = 0, paused = false;
     const changed = () => onChange && onChange(st);
     const tick = throttle(changed, 100);   // per-chunk progress; see the sender's p.tick
 
     const total = () => sum(st.files.filter((f) => f.status !== 'skipped'), 'size');
+    const unfinished = () => st.files.filter((f) => f.status !== 'saved' && f.status !== 'skipped');
+
+    // Ask the sender for everything we haven't finished. The file we were part-way through
+    // goes first, so it gets resumed before anything new is started.
+    const startUnfinished = () => {
+        const list = unfinished();
+        if (!list.length) { st.status = 'done'; changed(); return; }
+        const curId = cur ? cur.id : null;
+        const ordered = [...list.filter((f) => f.id === curId), ...list.filter((f) => f.id !== curId)];
+        ordered.forEach((f) => { if (f.status !== 'receiving') f.status = 'waiting'; });
+        st.status = 'saving';
+        st.meter.reset(Date.now());
+        link.send({ t: 'start', ids: ordered.map((f) => f.id) });
+        changed();
+    };
 
     // Serialize writes onto one promise chain: chunks arrive faster than the disk accepts
     // them, and they must land in order.
     const enqueue = (buf) => {
         const f = cur;
         pending += buf.byteLength;
-        if (!paused && pending > RECV_HIGH) { paused = true; conn.send({ t: 'pause' }); }
+        if (!paused && pending > RECV_HIGH) { paused = true; link.send({ t: 'pause' }); }
         const s = sink;
         queue = queue.then(async () => {
             try {
@@ -237,16 +271,17 @@ const createReceiver = ({ conn, onChange }) => {
             } finally {
                 // Always give the credit back, or flow control deadlocks on the next error.
                 pending -= buf.byteLength;
-                if (paused && pending < RECV_LOW) { paused = false; conn.send({ t: 'resume' }); }
+                if (paused && pending < RECV_LOW) { paused = false; link.send({ t: 'resume' }); }
             }
         }).catch((e) => fail(f, e));
     };
 
+    // A write error is fatal for this file — unlike a dropped connection, retrying won't help.
     const fail = (f, e) => {
         if (f) { f.status = 'failed'; f.error = String(e && e.message || e); }
         st.status = 'error';
         st.error = String(e && e.message || e);
-        conn.send({ t: 'fail', id: f && f.id, msg: st.error });
+        link.send({ t: 'fail', id: f && f.id, msg: st.error });
         changed();
     };
 
@@ -255,99 +290,138 @@ const createReceiver = ({ conn, onChange }) => {
         const wanted = st.files.filter((f) => f.status === 'offered');
         if (!wanted.length) return;
         st.dest = await chooser({ fileCount: wanted.length, suggestedName: wanted[0].name });
-        st.status = 'saving';
-        st.meter.reset(Date.now());
-        wanted.forEach((f) => { f.status = 'waiting'; });
-        conn.send({ t: 'start', ids: wanted.map((f) => f.id) });
-        changed();
+        startUnfinished();
     };
 
-    conn.on('open', async () => {
-        st.status = 'waiting-offer';
-        changed();
-        st.safety = await conn.safetyCode();
-        st.route = await conn.route();
-        changed();
-    });
-
-    conn.on('data', async (d) => {
-        if (!d || !d.t) return;
-        if (d.t === 'manifest') {
-            const seen = new Map(st.files.map((f) => [f.id, f]));
-            st.files = (d.files || []).map((f) => seen.get(f.id) || {
-                id: f.id, name: safeName(f.name), size: Number(f.size) || 0, type: f.type || '',
-                status: 'offered', recv: 0, error: '',
-            });
-            // The sender added files after we already picked a destination — take them too.
-            if (st.dest && st.files.some((f) => f.status === 'offered')) {
-                const extra = st.files.filter((f) => f.status === 'offered');
-                extra.forEach((f) => { f.status = 'waiting'; });
-                conn.send({ t: 'start', ids: extra.map((f) => f.id) });
-            } else if (st.status === 'waiting-offer' || st.status === 'connecting') {
-                st.status = 'offered';
-            }
-            st.total = total();
+    const wire = (c) => {
+        c.on('open', async () => {
+            if (st.status === 'connecting') st.status = 'waiting-offer';
             changed();
-            return;
-        }
-        if (d.t === 'file') {
-            const f = st.files.find((x) => x.id === d.id);
-            if (!f || !st.dest) { conn.send({ t: 'skip', id: d.id }); return; }
-            try {
-                await queue;                                  // let the previous file finish closing
-                sink = await st.dest.open(f.name, f.size);
-                cur = f;
-                f.savedAs = sink.name;
-                f.status = 'receiving';
-                changed();
-                conn.send({ t: 'ready', id: d.id });
-            } catch (e) {
-                sink = null; cur = null;
-                f.status = 'failed'; f.error = String(e && e.message || e);
-                conn.send({ t: 'skip', id: d.id, msg: f.error });
-                changed();
-            }
-            return;
-        }
-        if (d.t === 'end') {
-            const f = cur, s = sink;
-            sink = null; cur = null;
-            if (!f || !s) return;
-            queue = queue.then(async () => {
-                await s.close();
-                f.status = f.recv === f.size ? 'saved' : 'partial';
-                if (f.status === 'partial') f.error = 'incomplete';
-                conn.send(f.status === 'saved' ? { t: 'ok', id: f.id } : { t: 'fail', id: f.id, msg: 'incomplete' });
-                changed();
-            }).catch((e) => fail(f, e));
-            return;
-        }
-        if (d.t === 'done') {
-            queue = queue.then(() => {
-                if (st.status !== 'error' && st.files.some((f) => f.status === 'saved')) st.status = 'done';
-                changed();
-            });
-            return;
-        }
-        if (d.t === 'bye') { conn.close('bye'); }
-    });
-
-    conn.on('chunk', (buf) => enqueue(buf));
-
-    conn.on('close', (reason) => {
-        queue = queue.then(async () => {
-            if (sink) { await sink.abort().catch(() => {}); sink = null; }
-            if (cur && cur.status === 'receiving') { cur.status = 'failed'; cur.error = 'connection lost'; }
-            cur = null;
-            if (st.status !== 'done' && st.status !== 'error') { st.status = 'gone'; st.reason = reason; }
+            st.safety = await c.safetyCode();
+            st.route = await c.route();
             changed();
         });
-    });
+
+        c.on('data', async (d) => {
+            if (!d || !d.t) return;
+            if (d.t === 'manifest') {
+                const seen = new Map(st.files.map((f) => [f.id, f]));
+                st.files = (d.files || []).map((f) => seen.get(f.id) || {
+                    id: f.id, name: safeName(f.name), size: Number(f.size) || 0, type: f.type || '',
+                    status: 'offered', recv: 0, error: '',
+                });
+                st.total = total();
+                // Already have a destination? Then this is either a reconnect or the sender
+                // adding files mid-session — either way, ask for everything still outstanding.
+                if (st.dest) startUnfinished();
+                else if (st.status === 'waiting-offer' || st.status === 'connecting') st.status = 'offered';
+                changed();
+                return;
+            }
+            if (d.t === 'file') {
+                const f = st.files.find((x) => x.id === d.id);
+                if (!f || !st.dest) { c.send({ t: 'skip', id: d.id }); return; }
+                try {
+                    await queue;              // previous file finishes closing / pending writes land
+                    if (cur && cur.id === f.id && sink) {
+                        // Resuming the file we were part-way through: the sink is still open and
+                        // positioned exactly at f.recv, so just tell the sender where to pick up.
+                        f.status = 'receiving';
+                        changed();
+                        c.send({ t: 'ready', id: d.id, offset: f.recv });
+                        return;
+                    }
+                    if (f.recv > 0) f.recv = 0;   // no open sink for it → it has to start over
+                    sink = await st.dest.open(f.name, f.size);
+                    cur = f;
+                    f.savedAs = sink.name;
+                    f.status = 'receiving';
+                    changed();
+                    c.send({ t: 'ready', id: d.id, offset: 0 });
+                } catch (e) {
+                    sink = null; cur = null;
+                    f.status = 'failed'; f.error = String(e && e.message || e);
+                    c.send({ t: 'skip', id: d.id, msg: f.error });
+                    changed();
+                }
+                return;
+            }
+            if (d.t === 'end') {
+                const f = cur, s = sink;
+                sink = null; cur = null;
+                if (!f || !s) return;
+                queue = queue.then(async () => {
+                    await s.close();
+                    f.status = f.recv === f.size ? 'saved' : 'partial';
+                    if (f.status === 'partial') f.error = 'incomplete';
+                    c.send(f.status === 'saved' ? { t: 'ok', id: f.id } : { t: 'fail', id: f.id, msg: 'incomplete' });
+                    changed();
+                }).catch((e) => fail(f, e));
+                return;
+            }
+            if (d.t === 'done') {
+                queue = queue.then(() => {
+                    if (st.status !== 'error' && !unfinished().length) st.status = 'done';
+                    changed();
+                });
+                return;
+            }
+            if (d.t === 'bye') { st.senderQuit = true; c.close('bye'); }
+        });
+
+        c.on('chunk', (buf) => enqueue(buf));
+
+        c.on('close', (reason) => {
+            if (c !== link) return;                       // a stale connection we already replaced
+            queue = queue.then(async () => {
+                if (st.status === 'done' || st.status === 'error' || st.status === 'cancelled') return;
+                // Keep the part-written file and its open sink: if the peer comes back we
+                // continue at f.recv instead of starting the whole thing again.
+                if (st.dest && unfinished().length && !st.senderQuit) {
+                    st.status = 'reconnecting';
+                    st.reason = reason;
+                    st.resumes++;
+                } else {
+                    if (sink) { await sink.abort().catch(() => {}); sink = null; cur = null; }
+                    st.status = 'gone';
+                    st.reason = reason;
+                }
+                changed();
+            });
+        });
+    };
+
+    wire(conn);
 
     return {
-        state: st, accept,
+        state: st,
+        accept,
         totalBytes: total,
-        cancel() { conn.send({ t: 'bye' }); conn.close('bye'); },
+        // True when a fresh connection should continue this transfer rather than start a new one.
+        canRebind: () => st.status === 'reconnecting',
+        rebind(c) {
+            link = c;
+            paused = false;             // the new peer knows nothing about the old pause
+            st.status = 'saving';
+            wire(c);
+            changed();
+        },
+        // Give up waiting and keep whatever arrived, rather than throwing it away.
+        async salvage() {
+            const f = cur, s = sink;
+            sink = null; cur = null;
+            if (s) await queue.then(() => s.close()).catch(() => {});
+            if (f) { f.status = f.recv === f.size ? 'saved' : 'partial'; if (f.status === 'partial') f.error = `${f.recv} of ${f.size} bytes`; }
+            st.status = st.files.some((x) => x.status === 'saved') ? 'done' : 'gone';
+            changed();
+        },
+        async cancel() {
+            st.status = 'cancelled';
+            link.send({ t: 'bye' });
+            if (sink) { await queue.then(() => sink.abort()).catch(() => {}); sink = null; cur = null; }
+            link.close('bye');
+            changed();
+        },
     };
 };
 

@@ -87,6 +87,16 @@ const pickChunk = (maxMessageSize) => {
     return Math.max(MIN_CHUNK, Math.min(MAX_CHUNK, max - 1024)); // headroom for SCTP framing
 };
 
+// ---- resume ----
+// Where to restart a file, given the offset the *other side* claims to have. It's remote
+// input on a loop bound, so a negative or NaN value would spin forever and an oversized one
+// would silently skip data — clamp it into the file rather than trusting it.
+const clampOffset = (offset, size) => {
+    const n = Number(offset);
+    if (!isFinite(n) || n <= 0) return 0;
+    return Math.min(Math.floor(n), Math.max(0, Number(size) || 0));
+};
+
 // ---- transfer rate meter ----
 // Exponentially-weighted so the readout doesn't jump around on a bursty link, but still
 // reacts within a few seconds when the real throughput changes.
@@ -128,4 +138,4 @@ const sum = (arr, key) => arr.reduce((a, x) => a + (Number(key ? x[key] : x) || 
 const pct = (a, b) => (b > 0 ? Math.min(100, Math.max(0, (a / b) * 100)) : 0);
 
 export { esc, fmtBytes, fmtRate, fmtDur, makeCode, normCode, isCode, safeName, dedupeName,
-    pickChunk, makeMeter, throttle, rand, sum, pct, ALPHABET, MIN_CHUNK, MAX_CHUNK };
+    pickChunk, clampOffset, makeMeter, throttle, rand, sum, pct, ALPHABET, MIN_CHUNK, MAX_CHUNK };

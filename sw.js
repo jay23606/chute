@@ -2,7 +2,7 @@
 //   1. keep the app shell available offline (so it opens instantly / as an installed app),
 //   2. handle the OS share sheet ("Share → chute") by stashing the files for the page,
 //   3. nothing else — it never sees a byte of an actual transfer, which is peer-to-peer.
-const VERSION = 'chute-v1';
+const VERSION = 'chute-v2';
 const SHELL = [
     './', './index.html', './styles.css', './app.js', './core.js', './util.js',
     './rtc.js', './sink.js', './transfer.js', './icon.svg', './manifest.json',

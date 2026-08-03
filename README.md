@@ -47,6 +47,39 @@ run away:
 Chunk size is negotiated, not guessed: chute asks the transport for `sctp.maxMessageSize`
 and uses up to 256 KB where it's available, falling back to 16 KB where it isn't.
 
+## Resuming after a dropped connection
+
+Wi-Fi blips, laptops sleep, phones change cell. On a transfer measured in hours, starting a
+20 GB file over from zero isn't an option — so chute doesn't.
+
+When the connection dies mid-file the receiver **keeps the part-written file and its open
+sink**, and goes into a `reconnecting` state instead of throwing anything away. It also starts
+re-announcing itself on the signaling channel, so as soon as the sender is reachable again the
+two re-dial, and the receiver answers the sender's next `{t:'file'}` with the byte it stopped
+on:
+
+```
+recv → { t:'ready', id, offset: 8_142_483_456 }
+```
+
+The sender seeks its `File` to that offset and carries on. **The receiver is the sole authority
+on where to resume** — it's the side that knows what actually reached the disk — so the sender
+needs no memory of the interrupted attempt at all. Files already finished aren't re-offered,
+and the progress bar picks up where it left off rather than restarting.
+
+The offset is remote input used as a loop bound, so it's clamped into the file
+(`clampOffset`, unit-tested): a negative value would spin forever and an oversized one would
+silently skip data.
+
+If the sender never comes back, **Stop waiting and keep what arrived** commits the partial
+file rather than binning it.
+
+**What this doesn't cover:** closing or crashing the receiving tab. The File System Access
+API only commits a writable stream on `close()`, so there's no durable partial to resume from,
+and periodically committing to get one would mean re-copying the whole file each time
+(`keepExistingData` is a real copy) — O(n²) on exactly the huge files that need it most. Doing
+that properly means writing sequential part-files and merging at the end; it's not built.
+
 ## How private is it?
 
 The data channel is encrypted end to end (DTLS) and the file bytes only ever exist on the
@@ -67,7 +100,8 @@ don't, stop.
 - **Some mobile networks** block direct connections between devices (symmetric / carrier-grade
   NAT). On Wi-Fi it almost always works. To fix it everywhere, put TURN credentials in the
   `TURN` array at the top of [`rtc.js`](rtc.js).
-- **No resume.** If the connection drops mid-file, that file starts over.
+- **Dropped connections resume automatically** (see below) — but only while both tabs stay
+  open. Closing the receiving tab discards a part-received file.
 
 ## Install it
 
@@ -99,8 +133,10 @@ chunks → "that was all of X" needs no framing of its own.
 sender → { t:'manifest', files:[…] }        what's on offer
 recv   → { t:'start', ids:[…] }             a destination was picked, go
 sender → { t:'file', id, name, size }       next file
-recv   → { t:'ready', id } | { t:'skip' }   the sink is open — no race with the first chunk
-sender → «binary chunks…» → { t:'end', id }
+recv   → { t:'ready', id, offset } | { t:'skip' }
+                                            the sink is open (no race with the first chunk),
+                                            and `offset` is where to resume from
+sender → «binary chunks from offset…» → { t:'end', id }
 recv   → { t:'ok', id } | { t:'fail', id }  flushed to disk
 recv   → { t:'pause' } / { t:'resume' }     receiver-side flow control, any time
 sender → { t:'done' }
@@ -108,7 +144,8 @@ sender → { t:'done' }
 
 A sender can serve several receivers at once — each gets its own send loop over the same
 `File` handles. Files added mid-session are pushed as an updated manifest, and a receiver
-that already chose a destination picks them up automatically.
+that already chose a destination picks them up automatically — the same path a reconnecting
+receiver uses to ask for everything still outstanding.
 
 ### Tests
 
@@ -117,8 +154,13 @@ npm test
 ```
 
 `node --test`, zero dependencies. Covers the sanitiser against path-traversal filenames, the
-rate meter's convergence and ETA, chunk-size negotiation, the code alphabet, and the progress
-throttle's leading/trailing behaviour.
+resume-offset clamp, the rate meter's convergence and ETA, chunk-size negotiation, the code
+alphabet, and the progress throttle's leading/trailing behaviour.
+
+Beyond the unit tests, resume is verified in two real browsers: a 400 MB transfer severed
+three times mid-file (by closing the `RTCPeerConnection` outright) reassembles **byte-for-byte
+identical**, and a multi-file batch interrupted after the first file completes doesn't re-send
+what already landed.
 
 ## Family
 

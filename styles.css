@@ -134,6 +134,8 @@ body.dragging .drop { border-color: var(--accent); background: color-mix(in srgb
 .bar i { display: block; height: 100%; background: var(--accent); border-radius: 99px; transition: width .25s ease-out; }
 .bar.good i { background: var(--ok); }
 .bar.bad i { background: var(--bad); }
+/* waiting to reconnect — progress is held, not lost */
+.bar.wait i { background: repeating-linear-gradient(45deg, var(--accent), var(--accent) 8px, var(--accent2) 8px, var(--accent2) 16px); }
 
 .peer { border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 10px; background: var(--bg2); }
 .peerhd { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }

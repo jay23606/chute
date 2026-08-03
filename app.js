@@ -11,14 +11,16 @@ let room = null, sender = null, receiver = null, code = '', present = 0;
 
 const teardown = () => {
     if (sender) { sender.destroy(); sender = null; }
-    if (receiver) { receiver = null; }
+    // Cancel rather than drop: it aborts the part-written file instead of leaving it staged.
+    if (receiver) { receiver.cancel(); receiver = null; }
     if (room) { room.leave(); room = null; }
     code = ''; present = 0;
 };
 
-// The browser can't ask "are you sure?" without a reason — only nag when bytes are in flight.
+// The browser can't ask "are you sure?" without a reason — only nag when there's a transfer
+// to lose. 'reconnecting' counts: the part-written file only survives while this tab lives.
 const busy = () => !!(sender && [...sender.peers.values()].some((p) => p.status === 'sending'))
-    || !!(receiver && receiver.state.status === 'saving');
+    || !!(receiver && ['saving', 'reconnecting'].includes(receiver.state.status));
 window.addEventListener('beforeunload', (e) => { if (busy()) { e.preventDefault(); e.returnValue = ''; } });
 
 // ===================== shared bits =====================
@@ -202,13 +204,27 @@ const startReceive = (c) => {
     room = joinRoom(code, {
         role: 'recv',
         onConn: (conn) => {
+            // A connection arriving while we're mid-transfer is the sender coming back after
+            // a drop — hand it to the existing receiver so it resumes instead of restarting.
+            if (receiver && receiver.canRebind()) { receiver.rebind(conn); paintRecv(); return; }
             if (receiver) return conn.close('duplicate');   // one sender per room
-            receiver = createReceiver({ conn, onChange: paintRecv });
+            receiver = createReceiver({ conn, onChange: onRecvChange });
             paintRecv();
         },
         onStatus: (s) => { if (typeof s.present === 'number') { present = s.present; paintRecv(); } if (s.error) toast(s.error); },
     });
     viewRecv();
+};
+
+// Stop advertising ourselves once there's nothing left to receive — otherwise the sender
+// would keep re-dialling a finished peer forever.
+// Keep advertising ourselves while there's still something to receive — that's what lets a
+// dropped transfer reconnect. Stop only when it's genuinely over, or the sender would keep
+// re-dialling a finished peer forever.
+const DONE_STATES = ['done', 'cancelled', 'error'];
+const onRecvChange = (st) => {
+    if (room) room.announce(!DONE_STATES.includes(st.status));
+    paintRecv();
 };
 
 const viewRecv = () => {
@@ -232,8 +248,12 @@ const rxStatusLine = (st) => {
         case 'saving': {
             const eta = st.meter.eta(totalB - st.recvBytes);
             return `${bar(pct(st.recvBytes, totalB))}
-                <p class="muted small">${fmtBytes(st.recvBytes)} of ${fmtBytes(totalB)} · ${fmtRate(st.rate)} · ${fmtDur(eta)} left</p>`;
+                <p class="muted small">${fmtBytes(st.recvBytes)} of ${fmtBytes(totalB)} · ${fmtRate(st.rate)} · ${fmtDur(eta)} left${st.resumes ? ` · resumed ${st.resumes}×` : ''}</p>`;
         }
+        case 'reconnecting':
+            return `${bar(pct(st.recvBytes, totalB), 'wait')}
+                <div class="waiting"><span class="pulse"></span>Connection lost — waiting for the sender to come back.</div>
+                <p class="muted small">Nothing you've already received is lost: ${fmtBytes(st.recvBytes)} of ${fmtBytes(totalB)} is saved, and the transfer will pick up from there.</p>`;
         case 'done':
             return `${bar(100, 'good')}<p class="ok">Done — ${fmtBytes(st.recvBytes)} saved.</p>`;
         case 'error':
@@ -273,7 +293,10 @@ const paintRecv = throttle(() => {
            ${!canStreamToDisk() && receiver.totalBytes() > 2e9 ? `<p class="warn">This browser has to buffer the whole thing in memory, which may fail at this size. Chrome or Edge writes it straight to disk.</p>` : ''}`
         : st.status === 'saving'
             ? `<div class="row"><button class="ghost danger" id="cancelrx">Cancel</button></div>`
-            : `<div class="row"><a class="ghost" href="#/">Back</a></div>`;
+            : st.status === 'reconnecting'
+                ? `<div class="row"><button class="ghost" id="salvage">Stop waiting and keep what arrived</button>
+                   <button class="ghost danger" id="cancelrx">Cancel</button></div>`
+                : `<div class="row"><a class="ghost" href="#/">Back</a></div>`;
 
     const sa = $('#saveall');
     if (sa) sa.onclick = async () => {
@@ -288,6 +311,8 @@ const paintRecv = throttle(() => {
     };
     const cx = $('#cancelrx');
     if (cx) cx.onclick = () => { receiver.cancel(); toast('Transfer cancelled.'); };
+    const sv = $('#salvage');
+    if (sv) sv.onclick = () => { receiver.salvage(); toast('Saved what arrived.'); };
 }, 100);
 
 // ===================== about =====================
@@ -304,6 +329,9 @@ const viewAbout = () => {
         </ol>
         <h3>How private is it?</h3>
         <p>The connection is encrypted (DTLS) and the file bytes only ever exist on the two devices. The room code is the key: anyone who has it can receive the files, so share it the way you'd share a password. Both screens show a six-digit safety number once connected — if they match, nobody is in the middle.</p>
+        <h3>If the connection drops</h3>
+        <p>Nothing is lost and nothing starts over. What's already been received stays on disk, and as soon as the two devices can see each other again the transfer picks up at the exact byte it stopped on. If the sender doesn't come back, you can keep the part of the file that did arrive.</p>
+        <p>That holds as long as both tabs stay open. Closing the receiving tab does throw away a half-finished file.</p>
         <h3>Things to know</h3>
         <ul>
             <li>The sender's tab has to stay open for the whole transfer.</li>
