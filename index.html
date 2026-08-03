@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>chute — send big files, peer to peer</title>
+    <meta name="description" content="Send very large files directly from your device to someone else's. Nothing is uploaded to a server. Works in the browser, installs as an app.">
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#0b0d12">
+    <link rel="icon" href="icon.svg">
+    <link rel="apple-touch-icon" href="icon.svg">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="chute">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header class="top">
+        <a class="brand" href="#/" aria-label="chute home">
+            <img src="icon.svg" alt="" width="28" height="28">
+            <span>chute</span>
+        </a>
+        <div class="grow"></div>
+        <button id="install" class="ghost" hidden>Install</button>
+        <a class="ghost" href="#/about">How it works</a>
+    </header>
+
+    <main id="app" aria-live="polite"></main>
+
+    <footer class="bot">
+        <span>Files go straight from one browser to the other — never through a server.</span>
+    </footer>
+
+    <div id="toast" class="toast" role="status"></div>
+
+    <input id="picker" type="file" multiple hidden>
+    <input id="dirpicker" type="file" webkitdirectory hidden>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

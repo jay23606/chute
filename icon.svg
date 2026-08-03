@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="chute">
+  <rect width="512" height="512" rx="112" fill="#0b0d12"/>
+  <!-- canopy -->
+  <path d="M96 232a160 160 0 0 1 320 0z" fill="#5ad1a4"/>
+  <path d="M203 232c0-88 24-160 53-160s53 72 53 160z" fill="#0b0d12" opacity=".22"/>
+  <!-- rigging -->
+  <g stroke="#5ad1a4" stroke-width="14" stroke-linecap="round" fill="none">
+    <path d="M104 236 256 330"/>
+    <path d="M256 232 256 330"/>
+    <path d="M408 236 256 330"/>
+  </g>
+  <!-- payload -->
+  <rect x="212" y="332" width="88" height="88" rx="18" fill="#e7eaf3"/>
+  <path d="M256 356v42m0 0-16-16m16 16 16-16" stroke="#0b0d12" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>

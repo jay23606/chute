@@ -1,0 +1,10 @@
+{
+  "name": "chute",
+  "private": true,
+  "type": "module",
+  "description": "Peer-to-peer sending for very large files. No build step, no server, no upload.",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check util.js && node --check core.js && node --check rtc.js && node --check sink.js && node --check transfer.js && node --check app.js && node --check sw.js"
+  }
+}

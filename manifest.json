@@ -1,0 +1,25 @@
+{
+  "name": "chute — peer-to-peer file sending",
+  "short_name": "chute",
+  "description": "Send very large files straight from your device to someone else's. No upload, no size limit, no account.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#0b0d12",
+  "theme_color": "#0b0d12",
+  "categories": ["utilities", "productivity"],
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ],
+  "share_target": {
+    "action": "share",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "files": [{ "name": "files", "accept": ["*/*"] }]
+    }
+  }
+}
